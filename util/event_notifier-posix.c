@@ -20,10 +20,9 @@
 #include <sys/eventfd.h>
 #endif
 
-#ifdef CONFIG_EVENTFD
 /*
  * Initialize @e with existing file descriptor @fd.
- * @fd must be a genuine eventfd object, emulation with pipe won't do.
+ * On Linux: @fd is an eventfd. On macOS: @fd is a pipe end.
  */
 void event_notifier_init_fd(EventNotifier *e, int fd)
 {
@@ -31,7 +30,6 @@ void event_notifier_init_fd(EventNotifier *e, int fd)
     e->wfd = fd;
     e->initialized = true;
 }
-#endif
 
 int event_notifier_init(EventNotifier *e, int active)
 {

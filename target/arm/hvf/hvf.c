@@ -2175,14 +2175,54 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         assert(!s1ptw);
 
         /*
-         * TODO: ISV will be 0 for SIMD or SVE accesses.
-         * Inject the exception into the guest.
+         * ISV=0: decode the faulting instruction to get Rt, size, direction.
          */
-        assert(isv);
+        if (!isv) {
+            uint64_t pc;
+            uint32_t insn;
+            hv_return_t r = hv_vcpu_get_reg(cpu->accel->fd, HV_REG_PC, &pc);
+            assert_hvf_ok(r);
+            address_space_read(cpu_get_address_space(cpu, ARMASIdx_NS),
+                               pc, MEMTXATTRS_UNSPECIFIED, &insn, sizeof(insn));
+            insn = le32_to_cpu(insn);
+
+            if (insn == 0) {
+                usleep(10000);
+                advance_pc = false;
+                break;
+            }
+
+            uint32_t op = (insn >> 22) & 0x3FF;
+            bool decoded = false;
+
+            if ((op & 0x3F9) == 0x391 || ((op & 0x3F9) == 0x389 && ((insn >> 11) & 1))) {
+                srt = insn & 0x1F;
+                sas = (insn >> 30) & 3;
+                len = 1 << sas;
+                iswrite = ((insn >> 22) & 1) == 0;
+                decoded = true;
+            } else if ((op & 0x3E0) == 0x280 || (op & 0x3E0) == 0x2C0) {
+                srt = insn & 0x1F;
+                sas = (insn >> 30) & 3;
+                len = (sas < 2) ? 4 : 8;
+                iswrite = ((insn >> 22) & 1) == 0;
+                decoded = true;
+            } else if ((op & 0x3F8) == 0x390 || (op & 0x3F8) == 0x388) {
+                srt = insn & 0x1F;
+                sas = (insn >> 30) & 3;
+                len = (sas == 0) ? 1 : (sas == 1) ? 2 : (1 << sas);
+                iswrite = ((insn >> 22) & 1) == 0;
+                decoded = true;
+            }
+
+            if (!decoded) {
+                advance_pc = true;
+                break;
+            }
+        }
 
         /*
          * Emulate MMIO.
-         * TODO: Inject faults for errors.
          */
         if (iswrite) {
             val = hvf_get_reg(cpu, srt);
