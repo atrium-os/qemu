@@ -259,13 +259,18 @@ static void ivshmem_vector_notify(void *opaque)
     EventNotifier *n = &s->peers[s->vm_id].eventfds[vector];
 
     if (!event_notifier_test_and_clear(n)) {
+        fprintf(stderr, "ivshmem: vector_notify: test_and_clear FAILED\n");
         return;
     }
 
-    IVSHMEM_DPRINTF("interrupt on vector %p %d\n", pdev, vector);
     if (ivshmem_has_feature(s, IVSHMEM_MSI)) {
         if (msix_enabled(pdev)) {
             msix_notify(pdev, vector);
+        } else {
+            static int warn_count = 0;
+            if (warn_count++ < 3) {
+                fprintf(stderr, "ivshmem: vector_notify: msix NOT enabled\n");
+            }
         }
     } else {
         ivshmem_IntrStatus_write(s, 1);
@@ -348,6 +353,14 @@ static void ivshmem_vector_poll(PCIDevice *dev,
     }
 }
 
+static gboolean ivshmem_vector_notify_gio(GIOChannel *source,
+                                          GIOCondition condition,
+                                          gpointer data)
+{
+    ivshmem_vector_notify(data);
+    return TRUE; /* keep watching */
+}
+
 static void watch_vector_notifier(IVShmemState *s, EventNotifier *n,
                                  int vector)
 {
@@ -356,8 +369,30 @@ static void watch_vector_notifier(IVShmemState *s, EventNotifier *n,
     assert(!s->msi_vectors[vector].pdev);
     s->msi_vectors[vector].pdev = PCI_DEVICE(s);
 
-    qemu_set_fd_handler(eventfd, ivshmem_vector_notify,
-                        NULL, &s->msi_vectors[vector]);
+    fprintf(stderr, "ivshmem: watch_vector_notifier: fd=%d vector=%d (GLib IO watch)\n",
+            eventfd, vector);
+
+    /* Use GLib IO watch directly instead of qemu_set_fd_handler. */
+    GIOChannel *channel = g_io_channel_unix_new(eventfd);
+    g_io_add_watch(channel, G_IO_IN | G_IO_PRI | G_IO_HUP | G_IO_ERR,
+                   ivshmem_vector_notify_gio, &s->msi_vectors[vector]);
+    g_io_channel_unref(channel);
+
+    {
+        int flags = fcntl(eventfd, F_GETFL);
+        fprintf(stderr, "ivshmem: fd=%d flags=0x%x (O_NONBLOCK=%d)\n",
+                eventfd, flags, (flags & O_NONBLOCK) ? 1 : 0);
+    }
+
+    /* Debug: check if pipe has pending data after 2 seconds */
+    {
+        static int timer_tested = 0;
+        if (!timer_tested) {
+            timer_tested = 1;
+            /* Just try a non-blocking read to see if data accumulates */
+            fprintf(stderr, "ivshmem: will check fd=%d for data later\n", eventfd);
+        }
+    }
 }
 
 static void ivshmem_add_eventfd(IVShmemState *s, int posn, int i)
