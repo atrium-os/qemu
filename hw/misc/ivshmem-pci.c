@@ -367,9 +367,20 @@ static void ivshmem_poll_timer_cb(void *opaque)
     int i;
     static int dbg_count = 0;
 
+    if (dbg_count == 0) {
+        fprintf(stderr, "ivshmem: poll_timer FIRED (vectors=%d vm_id=%d nb_peers=%d)\n",
+                s->vectors, s->vm_id, s->nb_peers);
+    }
+
     for (i = 0; i < s->vectors; i++) {
         if (s->peers && s->vm_id < s->nb_peers) {
             EventNotifier *n = &s->peers[s->vm_id].eventfds[i];
+            if (dbg_count == 0) {
+                int fd = event_notifier_get_fd(n);
+                fprintf(stderr, "ivshmem: checking eventfd=%d initialized=%d\n",
+                        fd, n->initialized);
+                dbg_count = 1;
+            }
             if (event_notifier_test_and_clear(n)) {
                 if (ivshmem_has_feature(s, IVSHMEM_MSI) && msix_enabled(PCI_DEVICE(s))) {
                     msix_notify(PCI_DEVICE(s), i);
