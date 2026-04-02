@@ -117,6 +117,9 @@ struct IVShmemState {
     /* migration stuff */
     OnOffAuto master;
     Error *migration_blocker;
+
+    /* macOS poll timer (workaround for GLib not polling pipe fds) */
+    QEMUTimer *poll_timer;
 };
 
 /* registers for the Inter-VM shared memory device */
@@ -353,12 +356,38 @@ static void ivshmem_vector_poll(PCIDevice *dev,
     }
 }
 
-static gboolean ivshmem_vector_notify_gio(GIOChannel *source,
-                                          GIOCondition condition,
-                                          gpointer data)
+/*
+ * macOS + HVF workaround: QEMU's GLib main loop doesn't poll pipe fds
+ * reliably. Use a 1ms QEMU timer to check the pipe instead.
+ * On native hardware, the poll overhead is negligible (~1 syscall/ms).
+ */
+static void ivshmem_poll_timer_cb(void *opaque)
 {
-    ivshmem_vector_notify(data);
-    return TRUE; /* keep watching */
+    IVShmemState *s = opaque;
+    int i;
+    static int dbg_count = 0;
+
+    for (i = 0; i < s->vectors; i++) {
+        if (s->peers && s->vm_id < s->nb_peers) {
+            EventNotifier *n = &s->peers[s->vm_id].eventfds[i];
+            if (event_notifier_test_and_clear(n)) {
+                if (ivshmem_has_feature(s, IVSHMEM_MSI) && msix_enabled(PCI_DEVICE(s))) {
+                    msix_notify(PCI_DEVICE(s), i);
+                    if (dbg_count++ < 3) {
+                        fprintf(stderr, "ivshmem: poll_timer: msix_notify vector=%d\n", i);
+                    }
+                } else {
+                    ivshmem_IntrStatus_write(s, 1);
+                    if (dbg_count++ < 3) {
+                        fprintf(stderr, "ivshmem: poll_timer: IntrStatus (msix_enabled=%d)\n",
+                                msix_enabled(PCI_DEVICE(s)));
+                    }
+                }
+            }
+        }
+    }
+
+    timer_mod(s->poll_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
 }
 
 static void watch_vector_notifier(IVShmemState *s, EventNotifier *n,
@@ -369,30 +398,20 @@ static void watch_vector_notifier(IVShmemState *s, EventNotifier *n,
     assert(!s->msi_vectors[vector].pdev);
     s->msi_vectors[vector].pdev = PCI_DEVICE(s);
 
-    fprintf(stderr, "ivshmem: watch_vector_notifier: fd=%d vector=%d (GLib IO watch)\n",
+    fprintf(stderr, "ivshmem: watch_vector_notifier: fd=%d vector=%d\n",
             eventfd, vector);
 
-    /* Use GLib IO watch directly instead of qemu_set_fd_handler. */
-    GIOChannel *channel = g_io_channel_unix_new(eventfd);
-    g_io_add_watch(channel, G_IO_IN | G_IO_PRI | G_IO_HUP | G_IO_ERR,
-                   ivshmem_vector_notify_gio, &s->msi_vectors[vector]);
-    g_io_channel_unref(channel);
-
-    {
-        int flags = fcntl(eventfd, F_GETFL);
-        fprintf(stderr, "ivshmem: fd=%d flags=0x%x (O_NONBLOCK=%d)\n",
-                eventfd, flags, (flags & O_NONBLOCK) ? 1 : 0);
+    /* Start poll timer on first vector setup (macOS workaround) */
+    if (!s->poll_timer) {
+        s->poll_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                      ivshmem_poll_timer_cb, s);
+        timer_mod(s->poll_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
+        fprintf(stderr, "ivshmem: started 1ms poll timer for doorbell\n");
     }
 
-    /* Debug: check if pipe has pending data after 2 seconds */
-    {
-        static int timer_tested = 0;
-        if (!timer_tested) {
-            timer_tested = 1;
-            /* Just try a non-blocking read to see if data accumulates */
-            fprintf(stderr, "ivshmem: will check fd=%d for data later\n", eventfd);
-        }
-    }
+    /* Also register fd handler as fallback (works on Linux) */
+    qemu_set_fd_handler(eventfd, ivshmem_vector_notify,
+                        NULL, &s->msi_vectors[vector]);
 }
 
 static void ivshmem_add_eventfd(IVShmemState *s, int posn, int i)
