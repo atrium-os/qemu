@@ -615,6 +615,26 @@ int qemu_fdatasync(int fd)
 {
 #ifdef CONFIG_FDATASYNC
     return fdatasync(fd);
+#elif defined(__APPLE__)
+    /*
+     * macOS fsync(2) flushes data to the host's storage stack but does
+     * NOT flush the SSD's volatile write cache, so it provides no real
+     * crash-safety barrier for guest filesystems. F_BARRIERFSYNC
+     * (macOS 11+) is the documented way to get a true barrier: it
+     * issues an ordering point on the device so all previously
+     * submitted writes are durable before subsequent ones — exactly
+     * the semantics a guest BIO_FLUSH needs. Order of preference:
+     *   F_BARRIERFSYNC  — barrier semantics, ~1-5ms, what we want
+     *   F_FULLFSYNC     — full media flush, ~10-20ms, fallback
+     *   fsync           — page-cache flush only, last resort
+     */
+# ifdef F_BARRIERFSYNC
+    if (fcntl(fd, F_BARRIERFSYNC) == 0) return 0;
+    /* EINVAL: fs / device doesn't support it (network FS, tmpfs).
+     * Fall through to F_FULLFSYNC which is universal on Darwin. */
+# endif
+    if (fcntl(fd, F_FULLFSYNC) == 0) return 0;
+    return fsync(fd);
 #else
     return fsync(fd);
 #endif
