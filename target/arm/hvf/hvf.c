@@ -301,6 +301,10 @@ void hvf_arm_init_debug(void)
 #define TMR_CTL_IMASK   (1 << 1)
 #define TMR_CTL_ISTATUS (1 << 2)
 
+/* Forward decl: callback used by hvf_arch_init_vcpu, defined alongside
+ * hvf_wfi() further down. */
+static void hvf_wfi_timer_cb(void *opaque);
+
 static uint32_t chosen_ipa_bit_size;
 
 typedef struct HVFVTimer {
@@ -1214,6 +1218,11 @@ void hvf_arch_vcpu_destroy(CPUState *cpu)
 {
     hv_return_t ret;
 
+    if (cpu->accel->wfi_timer) {
+        timer_free(cpu->accel->wfi_timer);
+        cpu->accel->wfi_timer = NULL;
+    }
+
     ret = hv_vcpu_destroy(cpu->accel->fd);
     assert_hvf_ok(ret);
 }
@@ -1269,6 +1278,12 @@ int hvf_arch_init_vcpu(CPUState *cpu)
 #undef DEF_SYSREG_15_02
     }
     env->aarch64 = true;
+
+    /* Per-vCPU host-side WFI wakeup timer. See AccelCPUState comment
+     * in include/system/hvf_int.h. QEMU_CLOCK_VIRTUAL pauses with the
+     * VM, so deadlines stay consistent across pause/resume. */
+    cpu->accel->wfi_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                          hvf_wfi_timer_cb, cpu);
 
     /* system count frequency sanity check */
     assert(arm_cpu->gt_cntfrq_hz == get_cntfrq_el0());
@@ -2027,8 +2042,29 @@ static uint64_t hvf_vtimer_val_raw(void)
     return mach_absolute_time() - hvf_state->vtimer_offset;
 }
 
+/*
+ * Wakeup callback for the WFI host-side timer. Raises the GIC vtimer
+ * line; that propagates through the GIC to cpu_interrupt(), which calls
+ * qemu_cpu_kick() and broadcasts halt_cond — waking the parked vCPU
+ * thread out of qemu_cond_wait(). The vCPU then re-enters
+ * hv_vcpu_run(), and HVF will deliver the IRQ to the guest.
+ */
+static void hvf_wfi_timer_cb(void *opaque)
+{
+    CPUState *cpu = opaque;
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    qemu_set_irq(arm_cpu->gt_timer_outputs[GTIMER_VIRT], 1);
+}
+
 static int hvf_wfi(CPUState *cpu)
 {
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    hv_return_t r;
+    uint64_t ctl, cval;
+    int64_t ticks_to_sleep;
+    uint64_t cntfrq_period_ns;
+    int64_t nanos;
+
     if (cpu_has_work(cpu)) {
         /*
          * Don't bother to go into our "low power state" if
@@ -2037,6 +2073,54 @@ static int hvf_wfi(CPUState *cpu)
         return 0;
     }
 
+    /*
+     * Read the guest's vtimer control. If the timer is disabled or
+     * masked we can sleep indefinitely — only an external IRQ (or an
+     * IPI from cpus_kick_thread) will wake us. Otherwise we need a
+     * host-side wake-up at the vtimer's deadline because
+     * HV_EXIT_REASON_VTIMER_ACTIVATED only fires inside hv_vcpu_run().
+     */
+    r = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_CNTV_CTL_EL0, &ctl);
+    assert_hvf_ok(r);
+
+    if ((ctl & (TMR_CTL_ENABLE | TMR_CTL_IMASK)) == TMR_CTL_ENABLE) {
+        r = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_CNTV_CVAL_EL0, &cval);
+        assert_hvf_ok(r);
+
+        ticks_to_sleep = cval - hvf_vtimer_val_raw();
+        if (ticks_to_sleep <= 0) {
+            /* Already expired — don't bother halting; the next vCPU
+             * run will exit immediately with VTIMER_ACTIVATED. */
+            return 0;
+        }
+
+        cntfrq_period_ns = gt_cntfrq_period_ns(arm_cpu);
+        nanos = ticks_to_sleep * cntfrq_period_ns;
+
+        /*
+         * Skip very short sleeps — a context switch costs ~us, so for
+         * sub-context-switch deadlines just spin. Threshold matches
+         * the pre-b5f8f77271 hvf_wfi() (the upstream commit that
+         * removed the pselect-based sleep without replacing the
+         * vtimer wake mechanism, which is what we're fixing here).
+         */
+        if (nanos < 2 * SCALE_MS) {
+            return 0;
+        }
+
+        timer_mod_ns(cpu->accel->wfi_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + nanos);
+    }
+
+    /*
+     * Mark the vCPU halted. cpu_thread_is_idle() needs this to return
+     * true so qemu_process_cpu_events() blocks the thread in
+     * qemu_cond_wait() instead of busy-looping. The matching halted-
+     * clear lives in hvf_arch_vcpu_exec() — when an interrupt arrives
+     * (timer callback above, GIC IRQ source, or IPI), the kick wakes
+     * the cond_wait, cpu_has_work() becomes true, and we resume.
+     */
+    cpu->halted = 1;
     return EXCP_HLT;
 }
 
@@ -2372,7 +2456,15 @@ int hvf_arch_vcpu_exec(CPUState *cpu)
     hv_return_t r;
 
     if (cpu->halted) {
-        return EXCP_HLT;
+        if (!cpu_has_work(cpu)) {
+            /* Nothing to do — stay halted; cpu thread loop blocks
+             * again in qemu_cond_wait() after this returns. */
+            return EXCP_HLT;
+        }
+        /* Wakeup arrived (timer cb / GIC IRQ / IPI). Cancel any
+         * pending wfi_timer (harmless if not armed) and resume. */
+        timer_del(cpu->accel->wfi_timer);
+        cpu->halted = 0;
     }
 
     flush_cpu_state(cpu);

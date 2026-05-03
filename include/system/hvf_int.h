@@ -24,6 +24,9 @@ typedef hv_vcpu_t hvf_vcpuid;
 typedef hv_vcpuid_t hvf_vcpuid;
 #endif
 
+/* Forward decl — including qemu/timer.h here would pull in too much. */
+typedef struct QEMUTimer QEMUTimer;
+
 typedef struct hvf_vcpu_caps {
     uint64_t vmx_cap_pinbased;
     uint64_t vmx_cap_procbased;
@@ -48,6 +51,15 @@ struct AccelCPUState {
     hv_vcpu_exit_t *exit;
     bool vtimer_masked;
     bool guest_debug_enabled;
+    /*
+     * Host-side timer that wakes a WFI'd vCPU thread when the guest's
+     * vtimer would have fired. Necessary because HV_EXIT_REASON_VTIMER
+     * _ACTIVATED only fires inside hv_vcpu_run(), which is not running
+     * while the thread is parked in qemu_cond_wait(). Armed in
+     * hvf_wfi() with the deadline computed from CNTV_CVAL_EL0; callback
+     * raises the GIC vtimer line, which kicks the cpu thread.
+     */
+    QEMUTimer *wfi_timer;
 #endif
 };
 
