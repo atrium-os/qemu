@@ -61,6 +61,14 @@ if opengl.found()
   opengl_ss.add(when: [opengl],
                if_true: files('shader.c', 'console-gl.c', 'egl-helpers.c', 'egl-context.c'))
   ui_modules += {'opengl' : opengl_ss}
+elif virgl.found()
+  # Atrium patch: virglrenderer (with venus) is enabled but no EGL on
+  # this host (macOS). The virtio-gpu-virgl device source still pulls
+  # in ui/egl-helpers.h symbols, so we link a stub that defines every
+  # extern as NULL/false. Runtime checks (qemu_egl_display != NULL)
+  # then keep the GL paths short-circuited and venus output flows
+  # through the standard 2D scanout path.
+  system_ss.add(files('../atrium-shim/egl-helpers-stub.c'))
 endif
 
 if opengl.found()

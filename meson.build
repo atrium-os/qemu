@@ -367,6 +367,11 @@ if host_os == 'darwin'
   if compiler.get_id() == 'gcc'
     qemu_common_flags += '-DOS_OBJECT_USE_OBJC=0'
   endif
+  # Atrium patch: shim include dir so our stub epoxy/egl.h wins over
+  # brew's libepoxy headers (which on macOS deliberately omit egl.h
+  # since Apple has no native EGL). Required for the venus-only
+  # virglrenderer path; harmless when EGL is genuinely available.
+  qemu_common_flags += '-I' + meson.project_source_root() + '/atrium-shim'
 elif host_os == 'sunos'
   # needed for CMSG_ macros in sys/socket.h
   qemu_common_flags += '-D_XOPEN_SOURCE=600'

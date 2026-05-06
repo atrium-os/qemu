@@ -157,7 +157,14 @@ virtio_gpu_get_flags(void *opaque)
     VirtIOGPUBase *g = opaque;
     int flags = GRAPHIC_FLAGS_NONE;
 
-    if (virtio_gpu_virgl_enabled(g->conf)) {
+    /* Atrium patch: only declare GRAPHIC_FLAGS_GL when actual GL
+     * (virgl capset 1) is in use. Venus (capset 2) renders through
+     * the host's Vulkan ICD via virglrenderer's render-server and
+     * presents via the standard 2D scanout path — no GL context
+     * needed on the display side. Without this gate, cocoa rejects
+     * the device with "The console requires a GL context." */
+    if (virtio_gpu_virgl_enabled(g->conf) &&
+        !virtio_gpu_venus_enabled(g->conf)) {
         flags |= GRAPHIC_FLAGS_GL;
     }
 

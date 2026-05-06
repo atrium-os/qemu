@@ -124,7 +124,11 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
         return;
     }
 
-    if (!display_opengl) {
+    /* Atrium patch: skip the display-OpenGL requirement when venus
+     * (capset 2) is in use. Venus output flows through virglrenderer's
+     * render-server process and reaches the display via the standard
+     * 2D scanout path — no host GL context needed. */
+    if (!display_opengl && !virtio_gpu_venus_enabled(g->parent_obj.conf)) {
         error_setg(errp,
                    "The display backend does not have OpenGL support enabled");
         error_append_hint(errp,

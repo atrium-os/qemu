@@ -1312,6 +1312,14 @@ virgl_create_context(void *opaque, int scanout_idx,
     QEMUGLContext ctx;
     QEMUGLParams qparams;
 
+    /* Atrium patch: GL-less hosts (macOS) have no console GL ops.
+     * dpy_gl_ctx_create asserts on con->gl. Return NULL instead;
+     * virglrenderer's vrend init recovers by skipping the GL capset
+     * entirely and venus stays operational. */
+    if (!console_has_gl(g->parent_obj.scanout[scanout_idx].con)) {
+        return NULL;
+    }
+
     qparams.major_ver = params->major_ver;
     qparams.minor_ver = params->minor_ver;
 
@@ -1324,6 +1332,9 @@ static void virgl_destroy_context(void *opaque, virgl_renderer_gl_context ctx)
     VirtIOGPU *g = opaque;
     QEMUGLContext qctx = (QEMUGLContext)ctx;
 
+    /* Atrium patch: see virgl_create_context. */
+    if (!ctx) return;
+    if (!console_has_gl(g->parent_obj.scanout[0].con)) return;
     dpy_gl_ctx_destroy(g->parent_obj.scanout[0].con, qctx);
 }
 
@@ -1333,6 +1344,9 @@ static int virgl_make_context_current(void *opaque, int scanout_idx,
     VirtIOGPU *g = opaque;
     QEMUGLContext qctx = (QEMUGLContext)ctx;
 
+    /* Atrium patch: GL-less hosts return failure instead of asserting. */
+    if (!ctx) return -1;
+    if (!console_has_gl(g->parent_obj.scanout[scanout_idx].con)) return -1;
     return dpy_gl_ctx_make_current(g->parent_obj.scanout[scanout_idx].con,
                                    qctx);
 }
@@ -1454,6 +1468,16 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
     if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
         flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;
     }
+    /* Atrium patch: skip vrend (the GL renderer) init when no host
+     * EGL is available — virglrenderer would otherwise fail with
+     * "Unable to create OpenGL context >= 3.0" and abort the device.
+     * On hosts without EGL, only venus is functional. The flag was
+     * added in virglrenderer 0.10.0 specifically for this case. */
+#ifdef VIRGL_RENDERER_NO_VIRGL
+    if (!qemu_egl_display) {
+        flags |= VIRGL_RENDERER_NO_VIRGL;
+    }
+#endif
     if (virtio_gpu_drm_enabled(g->parent_obj.conf)) {
         flags |= VIRGL_RENDERER_DRM;
 
@@ -1546,14 +1570,22 @@ GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g)
 
     capset_ids = g_array_new(false, false, sizeof(uint32_t));
 
-    /* VIRGL is always supported. */
-    virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VIRGL);
+    /* Atrium patch: skip the VIRGL/VIRGL2 (GL) capsets when no host
+     * EGL is available — venus is the only operable capset on those
+     * hosts. Advertising a capset whose GET_CAPSET_INFO will later
+     * fail (because virglrenderer is init'd with NO_VIRGL) confuses
+     * EDK2's VirtioGpuDxe and stalls the firmware before kernel
+     * handoff. */
+    if (qemu_egl_display) {
+        /* VIRGL is always supported when GL is available. */
+        virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VIRGL);
 
-    virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL2,
-                               &capset_max_ver,
-                               &capset_max_size);
-    if (capset_max_ver) {
-        virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VIRGL2);
+        virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL2,
+                                   &capset_max_ver,
+                                   &capset_max_size);
+        if (capset_max_ver) {
+            virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VIRGL2);
+        }
     }
 
     if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
