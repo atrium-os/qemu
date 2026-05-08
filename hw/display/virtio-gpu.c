@@ -19,6 +19,7 @@
 #include "ui/rect.h"
 #include "trace.h"
 #include "system/dma.h"
+#include "../../atrium_trace.h"
 #include "system/system.h"
 #include "hw/virtio/virtio.h"
 #include "migration/qemu-file-types.h"
@@ -975,6 +976,7 @@ void virtio_gpu_simple_process_cmd(VirtIOGPU *g,
 {
     VIRTIO_GPU_FILL_CMD(cmd->cmd_hdr);
     virtio_gpu_ctrl_hdr_bswap(&cmd->cmd_hdr);
+    ATRIUM_TRACE_INSTANT_ID("qemu.process_cmd", cmd->cmd_hdr.fence_id);
 
     switch (cmd->cmd_hdr.type) {
     case VIRTIO_GPU_CMD_GET_DISPLAY_INFO:
@@ -1093,8 +1095,11 @@ static void virtio_gpu_process_fenceq(VirtIOGPU *g)
     struct virtio_gpu_ctrl_command *cmd, *tmp;
 
     QTAILQ_FOREACH_SAFE(cmd, &g->fenceq, next, tmp) {
+        ATRIUM_TRACE_INSTANT_ID("qemu.fence_resp", cmd->cmd_hdr.fence_id);
         trace_virtio_gpu_fence_resp(cmd->cmd_hdr.fence_id);
         virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
+        ATRIUM_TRACE_INSTANT_ID("qemu.fence_resp.notified",
+                                cmd->cmd_hdr.fence_id);
         QTAILQ_REMOVE(&g->fenceq, cmd, next);
         g_free(cmd);
         g->inflight--;
@@ -1117,7 +1122,10 @@ static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
     VirtIOGPU *g = VIRTIO_GPU(vdev);
     struct virtio_gpu_ctrl_command *cmd;
 
+    ATRIUM_TRACE_BEGIN("qemu.handle_ctrl");
+
     if (!virtio_queue_ready(vq)) {
+        ATRIUM_TRACE_END("qemu.handle_ctrl");
         return;
     }
 
@@ -1126,11 +1134,14 @@ static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
         cmd->vq = vq;
         cmd->error = 0;
         cmd->finished = false;
+        ATRIUM_TRACE_INSTANT_ID("qemu.handle_ctrl.cmd_popped",
+                                cmd->cmd_hdr.fence_id);
         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     }
 
     virtio_gpu_process_cmdq(g);
+    ATRIUM_TRACE_END("qemu.handle_ctrl");
 }
 
 static void virtio_gpu_ctrl_bh(void *opaque)

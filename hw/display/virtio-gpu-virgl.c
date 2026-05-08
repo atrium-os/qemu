@@ -19,6 +19,7 @@
 #include "hw/virtio/virtio-gpu.h"
 #include "hw/virtio/virtio-gpu-bswap.h"
 #include "hw/virtio/virtio-gpu-pixman.h"
+#include "../../atrium_trace.h"
 
 #include "ui/egl-helpers.h"
 
@@ -1031,6 +1032,7 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
     int ret;
 
     VIRTIO_GPU_FILL_CMD(cmd->cmd_hdr);
+    ATRIUM_TRACE_INSTANT_ID("qemu.process_cmd", cmd->cmd_hdr.fence_id);
 
     virgl_renderer_force_ctx_0();
     switch (cmd->cmd_hdr.type) {
@@ -1190,12 +1192,16 @@ static void virgl_write_context_fence(void *opaque, uint32_t ctx_id,
     VirtIOGPU *g = opaque;
     struct virtio_gpu_ctrl_command *cmd, *tmp;
 
+    ATRIUM_TRACE_INSTANT_ID("qemu.write_context_fence", fence_id);
     QTAILQ_FOREACH_SAFE(cmd, &g->fenceq, next, tmp) {
         if (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX &&
             cmd->cmd_hdr.ctx_id == ctx_id && cmd->cmd_hdr.ring_idx == ring_idx &&
             cmd->cmd_hdr.fence_id <= fence_id) {
+            ATRIUM_TRACE_INSTANT_ID("qemu.fence_resp", cmd->cmd_hdr.fence_id);
             trace_virtio_gpu_fence_resp(cmd->cmd_hdr.fence_id);
             virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
+            ATRIUM_TRACE_INSTANT_ID("qemu.fence_resp.notified",
+                                    cmd->cmd_hdr.fence_id);
             QTAILQ_REMOVE(&g->fenceq, cmd, next);
             g_free(cmd);
             g->inflight--;
@@ -1458,6 +1464,21 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
         flags |= VIRGL_RENDERER_THREAD_SYNC;
 #endif
     }
+#if VIRGL_CHECK_VERSION(1, 1, 2)
+    /* Atrium patch: enable async fence callback for venus even without
+     * EGL. Without it, QEMU falls back to a 10ms polling timer
+     * (virtio_gpu_fence_poll) which adds ~10ms to every venus command's
+     * round-trip latency. The async path uses a QEMU BH (bottom-half)
+     * scheduled directly from the worker's fence-retire signal, no
+     * polling. EGL is only required for vrend's GL fence path; venus
+     * needs only write_context_fence which works fine without EGL. */
+    if (!qemu_egl_display && virtio_gpu_venus_enabled(g->parent_obj.conf)) {
+        virtio_gpu_3d_cbs.version = 4;
+        virtio_gpu_3d_cbs.write_context_fence = virgl_write_async_context_fence;
+        flags |= VIRGL_RENDERER_ASYNC_FENCE_CB;
+        flags |= VIRGL_RENDERER_THREAD_SYNC;
+    }
+#endif
 #endif
 #ifdef VIRGL_RENDERER_D3D11_SHARE_TEXTURE
     if (qemu_egl_angle_d3d) {

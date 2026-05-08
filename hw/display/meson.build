@@ -67,7 +67,7 @@ system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.
 if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
   virtio_gpu_ss = ss.source_set()
   virtio_gpu_ss.add(when: 'CONFIG_VIRTIO_GPU',
-                    if_true: [files('virtio-gpu-base.c', 'virtio-gpu.c'), pixman])
+                    if_true: [files('virtio-gpu-base.c', 'virtio-gpu.c', 'atrium_trace.c'), pixman])
   if host_os == 'linux'
     virtio_gpu_ss.add(files('virtio-gpu-udmabuf.c'))
   else
@@ -83,7 +83,7 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
   if virgl.found()
     virtio_gpu_gl_ss = ss.source_set()
     virtio_gpu_gl_ss.add(when: ['CONFIG_VIRTIO_GPU', virgl],
-                         if_true: [files('virtio-gpu-gl.c', 'virtio-gpu-virgl.c'), pixman, virgl])
+                         if_true: [files('virtio-gpu-gl.c', 'virtio-gpu-virgl.c', 'atrium_trace.c'), pixman, virgl])
     hw_display_modules += {'virtio-gpu-gl': virtio_gpu_gl_ss}
   endif
 

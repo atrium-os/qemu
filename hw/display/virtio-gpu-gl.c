@@ -21,6 +21,7 @@
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-gpu.h"
 #include "hw/virtio/virtio-gpu-bswap.h"
+#include "../../atrium_trace.h"
 #include "hw/virtio/virtio-gpu-pixman.h"
 #include "hw/core/qdev-properties.h"
 
@@ -66,11 +67,15 @@ static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
     VirtIOGPU *g = VIRTIO_GPU(vdev);
     struct virtio_gpu_ctrl_command *cmd;
 
+    ATRIUM_TRACE_BEGIN("qemu.handle_ctrl");
+
     if (!virtio_queue_ready(vq)) {
+        ATRIUM_TRACE_END("qemu.handle_ctrl");
         return;
     }
 
     if (!virtio_gpu_virgl_update_render_state(g)) {
+        ATRIUM_TRACE_END("qemu.handle_ctrl");
         return;
     }
 
@@ -79,12 +84,15 @@ static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
         cmd->vq = vq;
         cmd->error = 0;
         cmd->finished = false;
+        ATRIUM_TRACE_INSTANT_ID("qemu.handle_ctrl.cmd_popped",
+                                cmd->cmd_hdr.fence_id);
         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     }
 
     virtio_gpu_process_cmdq(g);
     virtio_gpu_virgl_fence_poll(g);
+    ATRIUM_TRACE_END("qemu.handle_ctrl");
 }
 
 static void virtio_gpu_gl_reset(VirtIODevice *vdev)
