@@ -518,11 +518,20 @@ static void virgl_cmd_context_destroy(VirtIOGPU *g,
 static void virtio_gpu_rect_update(VirtIOGPU *g, int idx, int x, int y,
                                 int width, int height)
 {
-    if (!g->parent_obj.scanout[idx].con) {
+    QemuConsole *con = g->parent_obj.scanout[idx].con;
+    if (!con) {
+        return;
+    }
+    /* Non-GL backend (e.g. Cocoa): the BLOB scanout was wired through
+     * dpy_gfx_replace_surface with a pixman_image over res->map_fixed
+     * (set_scanout_blob path). The host-side pixels are already there;
+     * just nudge the display backend to repaint the dirty rect. */
+    if (!console_has_gl(con)) {
+        dpy_gfx_update(con, x, y, width, height);
         return;
     }
 
-    dpy_gl_update(g->parent_obj.scanout[idx].con, x, y, width, height);
+    dpy_gl_update(con, x, y, width, height);
 }
 
 static void virgl_cmd_resource_flush(VirtIOGPU *g,
@@ -585,16 +594,21 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
         qemu_console_resize(g->parent_obj.scanout[ss.scanout_id].con,
                             ss.r.width, ss.r.height);
         virgl_renderer_force_ctx_0();
-        dpy_gl_scanout_texture(
-            g->parent_obj.scanout[ss.scanout_id].con, info.tex_id,
-            info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP,
-            info.width, info.height,
-            ss.r.x, ss.r.y, ss.r.width, ss.r.height,
-            d3d_tex2d);
+        /* dpy_gl_scanout_texture asserts con->gl; skip on headless. */
+        if (console_has_gl(g->parent_obj.scanout[ss.scanout_id].con)) {
+            dpy_gl_scanout_texture(
+                g->parent_obj.scanout[ss.scanout_id].con, info.tex_id,
+                info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP,
+                info.width, info.height,
+                ss.r.x, ss.r.y, ss.r.width, ss.r.height,
+                d3d_tex2d);
+        }
     } else {
         dpy_gfx_replace_surface(
             g->parent_obj.scanout[ss.scanout_id].con, NULL);
-        dpy_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);
+        if (console_has_gl(g->parent_obj.scanout[ss.scanout_id].con)) {
+            dpy_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);
+        }
     }
     g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
 }
@@ -1001,12 +1015,6 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
         return;
     }
-    if (res->base.dmabuf_fd < 0) {
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource not backed by dmabuf %d\n",
-                      __func__, ss.resource_id);
-        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
-        return;
-    }
 
     if (!virtio_gpu_scanout_blob_to_fb(&fb, &ss, res->base.blob_size)) {
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
@@ -1014,6 +1022,91 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
     }
 
     g->parent_obj.enable = 1;
+
+    /*
+     * Atrium / non-GL display backend path (Cocoa, headless, etc.).
+     *
+     * Upstream QEMU's BLOB scanout requires a Linux dmabuf fd because
+     * the scanout texture is consumed via EGL on a GL-capable display
+     * backend (gtk-gl, sdl-gl, dbus, spice). On macOS Cocoa there is
+     * no GL DCL registered (cocoa.m never calls
+     * qemu_console_set_display_gl_ctx), so console_has_gl(con) is
+     * false and dmabuf is irrelevant.
+     *
+     * Venus on macOS already renders into host memory directly: the
+     * HOST3D + USE_MAPPABLE blob is mmap'd into the host_visible BAR
+     * via virgl_renderer_resource_map_fixed (see resource_map_blob),
+     * and `res->map_fixed` is the host-side pointer to those pixels.
+     * We just need to wrap that pointer in a pixman_image, hand the
+     * resulting DisplaySurface to the console, and let dpy_gfx_update
+     * push frames on each resource_flush. No GL, no dmabuf.
+     *
+     * This is a strict superset of the existing dmabuf path: when a
+     * GL backend IS present, we keep the dmabuf path (which lets the
+     * display backend reuse the rendered GPU texture without a CPU
+     * copy). When it isn't, we fall through to the pixman path.
+     */
+    if (!console_has_gl(g->parent_obj.scanout[ss.scanout_id].con)) {
+        struct virtio_gpu_scanout *scanout =
+            &g->parent_obj.scanout[ss.scanout_id];
+        void *base = NULL;
+        void *data;
+        pixman_image_t *rect;
+
+        /*
+         * Two ways the host pointer can be reached after RESOURCE_MAP_BLOB:
+         *
+         *   - `res->map_fixed` — set when virgl_renderer_resource_map_fixed
+         *     succeeded (Linux EGL+dmabuf path). Direct host VA into the
+         *     hostmem mmap.
+         *
+         *   - `res->mr` — set when map_fixed returned -EOPNOTSUPP and we
+         *     fell back to the MemoryRegion path. On macOS HVF this is
+         *     the only path that survives stage-2 page-table refresh
+         *     (see virglrenderer's `__APPLE__` branch in
+         *     virgl_renderer_resource_map_fixed). The host pointer is
+         *     the MR's ram_ptr.
+         */
+        if (res->map_fixed) {
+            base = res->map_fixed;
+        } else if (res->mr) {
+            base = memory_region_get_ram_ptr(res->mr);
+        }
+        if (!base) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: resource %d not mapped (neither map_fixed nor mr); "
+                          "guest must RESOURCE_MAP_BLOB before SET_SCANOUT_BLOB "
+                          "on a non-GL display backend\n",
+                          __func__, ss.resource_id);
+            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            return;
+        }
+
+        data = (uint8_t *)base + fb.offset;
+        rect = pixman_image_create_bits(fb.format,
+                                        ss.r.width, ss.r.height,
+                                        data, fb.stride);
+        if (!rect) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+            return;
+        }
+
+        qemu_console_resize(scanout->con, ss.r.width, ss.r.height);
+        scanout->ds = qemu_create_displaysurface_pixman(rect);
+        pixman_image_unref(rect);
+        dpy_gfx_replace_surface(scanout->con, scanout->ds);
+
+        virtio_gpu_update_scanout(g, ss.scanout_id, &res->base, &fb, &ss.r);
+        return;
+    }
+
+    if (res->base.dmabuf_fd < 0) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource not backed by dmabuf %d\n",
+                      __func__, ss.resource_id);
+        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+        return;
+    }
+
     if (virtio_gpu_update_dmabuf(g, ss.scanout_id, &res->base, &fb, &ss.r)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to update dmabuf\n",
                       __func__);
@@ -1420,7 +1513,9 @@ void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g)
 
     for (i = 0; i < g->parent_obj.conf.max_outputs; i++) {
         dpy_gfx_replace_surface(g->parent_obj.scanout[i].con, NULL);
-        dpy_gl_scanout_disable(g->parent_obj.scanout[i].con);
+        if (console_has_gl(g->parent_obj.scanout[i].con)) {
+            dpy_gl_scanout_disable(g->parent_obj.scanout[i].con);
+        }
     }
 }
 
