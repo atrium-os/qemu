@@ -215,6 +215,54 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
         return ret;
     }
 
+#ifdef CONFIG_DARWIN
+    /*
+     * macOS HVF: hv_vm_map() captures the host VA→PA mapping at call time
+     * and installs it in the guest's stage-2 page tables. Anonymous-SHM
+     * backed resources may not have their pages faulted in yet at this
+     * point, so HVF would otherwise capture whatever was at those host PAs
+     * before (typically QEMU's heap), producing a guest BAR view that
+     * aliases QEMU-internal data (struct pthread, etc.) rather than the
+     * intended resource contents.
+     *
+     * posix_madvise(WILLNEED) is too soft on Darwin — it's a hint that
+     * does not guarantee residency. The only reliable way to force
+     * fault-in is to touch each page. Read + write-back the first byte
+     * so the kernel materializes the page without changing its contents.
+     *
+     * The subsequent memory_region_add_subregion_overlap →
+     * MemoryListener → hv_vm_map call then captures the real backing
+     * pages in stage-2.
+     *
+     * This is a workaround for HVF's stage-2 mapping semantics; the
+     * architecturally cleaner fix would be in HVF's accel-ops or in
+     * Apple's hv_vm_map itself, but neither is available to us.
+     */
+    {
+        volatile unsigned char *p = (volatile unsigned char *)data;
+        size_t pgsz = (size_t)qemu_real_host_page_size();
+        /* Step 1: touch each page with a non-zero sentinel then zero it.
+         * Writing a distinct value (not zero) forces the kernel to break
+         * any CoW-zero-page optimization and allocate a unique writable
+         * page for this VA. The follow-up zero leaves the resource clean. */
+        for (size_t off = 0; off < size; off += pgsz) {
+            p[off] = 0xAB;
+        }
+        for (size_t off = 0; off < size; off += pgsz) {
+            p[off] = 0x00;
+        }
+        /* Step 2: pin the resident pages so they cannot be evicted between
+         * here and the hv_vm_map call performed by the MemoryListener.
+         * mlock failure is non-fatal — log and continue; behaviour may
+         * degrade but the touch above is the main load-bearing step. */
+        if (mlock(data, size) != 0) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: mlock failed: %s\n",
+                          __func__, strerror(errno));
+        }
+    }
+#endif
+
     vmr = g_new0(struct virtio_gpu_virgl_hostmem_region, 1);
     name = g_strdup_printf("blob[%" PRIu32 "]", res->base.resource_id);
     object_initialize_child(OBJECT(g), name, vmr,
