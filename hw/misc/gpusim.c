@@ -41,11 +41,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(GpusimState, GPUSIM)
 #define GPUSIM_MSIX_BAR 4
 #define GPUSIM_NUM_MSIX 8
 
-/* protocol */
-#define OP_REGION_ACCESS 1
-#define OP_CONFIG_READ 2
-#define REQ_LEN 20
-#define RESP_LEN 16
+/* framed protocol (see server/src/lib.rs) */
+#define C_REGION 0x01
+#define C_DMA_REPLY 0x05
+#define S_DMA_READ 0x81
+#define S_DMA_WRITE 0x82
+#define S_FINAL 0x83
 
 struct GpusimState {
     PCIDevice parent_obj;
@@ -70,6 +71,16 @@ static uint64_t get_le64(const uint8_t *p)
     }
     return v;
 }
+static void put_le32(uint8_t *p, uint32_t v)
+{
+    for (int i = 0; i < 4; i++) {
+        p[i] = (v >> (8 * i)) & 0xff;
+    }
+}
+static uint32_t get_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
 
 static bool io_all(int fd, void *buf, size_t n, bool writing)
 {
@@ -89,40 +100,83 @@ static bool io_all(int fd, void *buf, size_t n, bool writing)
     return true;
 }
 
-/* Synchronous request/response. Returns read data; sets *irq if the model
- * raised an interrupt (applied by the caller after the access). */
-static uint64_t gpusim_xchg(GpusimState *s, uint8_t op, uint8_t region, bool write_acc,
-                            uint8_t len, uint64_t offset, uint64_t data,
-                            bool *irq, uint8_t *vec)
+/* Send a REGION access, then service the model's DMA requests (translating them
+ * to guest-memory access via pci_dma) until the FINAL frame. Returns read data;
+ * sets the irq/vec out-params if the model raised an interrupt. */
+static uint64_t gpusim_region(GpusimState *s, uint8_t region, bool write_acc,
+                              uint8_t len, uint64_t offset, uint64_t data,
+                              bool *irq, uint8_t *vec)
 {
-    uint8_t req[REQ_LEN] = {0};
-    req[0] = op;
-    req[1] = region;
-    req[2] = write_acc ? 1 : 0;
-    req[3] = len;
-    put_le64(req + 4, offset);
-    put_le64(req + 12, data);
-
     if (irq) {
         *irq = false;
     }
     if (s->fd < 0) {
         return 0;
     }
-    if (!io_all(s->fd, req, REQ_LEN, true)) {
+    uint8_t req[20];
+    req[0] = C_REGION;
+    req[1] = region;
+    req[2] = write_acc ? 1 : 0;
+    req[3] = len;
+    put_le64(req + 4, offset);
+    put_le64(req + 12, data);
+    if (!io_all(s->fd, req, sizeof(req), true)) {
         return 0;
     }
-    uint8_t resp[RESP_LEN];
-    if (!io_all(s->fd, resp, RESP_LEN, false)) {
-        return 0;
-    }
-    if (irq && resp[8]) {
-        *irq = true;
-        if (vec) {
-            *vec = resp[9];
+
+    for (;;) {
+        uint8_t tag;
+        if (!io_all(s->fd, &tag, 1, false)) {
+            return 0;
+        }
+        if (tag == S_DMA_READ) {
+            uint8_t hdr[12];
+            if (!io_all(s->fd, hdr, sizeof(hdr), false)) {
+                return 0;
+            }
+            uint64_t gpa = get_le64(hdr);
+            uint32_t l = get_le32(hdr + 8);
+            uint8_t *buf = g_malloc(l);
+            pci_dma_read(PCI_DEVICE(s), gpa, buf, l);
+            uint8_t rep[6];
+            rep[0] = C_DMA_REPLY;
+            rep[1] = 0;
+            put_le32(rep + 2, l);
+            io_all(s->fd, rep, sizeof(rep), true);
+            io_all(s->fd, buf, l, true);
+            g_free(buf);
+        } else if (tag == S_DMA_WRITE) {
+            uint8_t hdr[12];
+            if (!io_all(s->fd, hdr, sizeof(hdr), false)) {
+                return 0;
+            }
+            uint64_t gpa = get_le64(hdr);
+            uint32_t l = get_le32(hdr + 8);
+            uint8_t *buf = g_malloc(l);
+            if (!io_all(s->fd, buf, l, false)) {
+                g_free(buf);
+                return 0;
+            }
+            pci_dma_write(PCI_DEVICE(s), gpa, buf, l);
+            g_free(buf);
+            uint8_t rep[6] = { C_DMA_REPLY, 0, 0, 0, 0, 0 };
+            io_all(s->fd, rep, sizeof(rep), true);
+        } else if (tag == S_FINAL) {
+            uint8_t fin[10];
+            if (!io_all(s->fd, fin, sizeof(fin), false)) {
+                return 0;
+            }
+            if (irq && fin[8]) {
+                *irq = true;
+                if (vec) {
+                    *vec = fin[9];
+                }
+            }
+            return get_le64(fin);
+        } else {
+            return 0;
         }
     }
-    return get_le64(resp);
 }
 
 static uint64_t gpusim_do_read(void *opaque, hwaddr addr, unsigned size, uint8_t region)
@@ -130,7 +184,7 @@ static uint64_t gpusim_do_read(void *opaque, hwaddr addr, unsigned size, uint8_t
     GpusimState *s = opaque;
     bool irq = false;
     uint8_t vec = 0;
-    uint64_t v = gpusim_xchg(s, OP_REGION_ACCESS, region, false, size, addr, 0, &irq, &vec);
+    uint64_t v = gpusim_region(s, region, false, size, addr, 0, &irq, &vec);
     if (irq) {
         msix_notify(PCI_DEVICE(s), vec);
     }
@@ -142,7 +196,7 @@ static void gpusim_do_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
     GpusimState *s = opaque;
     bool irq = false;
     uint8_t vec = 0;
-    gpusim_xchg(s, OP_REGION_ACCESS, region, true, size, addr, val, &irq, &vec);
+    gpusim_region(s, region, true, size, addr, val, &irq, &vec);
     if (irq) {
         msix_notify(PCI_DEVICE(s), vec);
     }
