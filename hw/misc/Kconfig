@@ -263,3 +263,8 @@ config XLNX_VERSAL_TRNG
     bool
 
 source macio/Kconfig
+
+config GPUSIM
+    bool
+    default y
+    depends on PCI && MSI_NONBROKEN
