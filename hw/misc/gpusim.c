@@ -44,6 +44,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GpusimState, GPUSIM)
 /* framed protocol (see server/src/lib.rs) */
 #define C_REGION 0x01
 #define C_DMA_REPLY 0x05
+#define C_CONFIG_WRITE 0x07
 #define S_DMA_READ 0x81
 #define S_DMA_WRITE 0x82
 #define S_FINAL 0x83
@@ -179,6 +180,27 @@ static uint64_t gpusim_region(GpusimState *s, uint8_t region, bool write_acc,
     }
 }
 
+/* Forward a config-space dword write to the model (offset:u64 value:u32), then
+ * consume the FINAL ack. Lets the model's referee see COMMAND enable bits. */
+static void gpusim_config_forward(GpusimState *s, uint64_t offset, uint32_t value)
+{
+    if (s->fd < 0) {
+        return;
+    }
+    uint8_t req[13];
+    req[0] = C_CONFIG_WRITE;
+    put_le64(req + 1, offset);
+    put_le32(req + 9, value);
+    if (!io_all(s->fd, req, sizeof(req), true)) {
+        return;
+    }
+    uint8_t tag;
+    if (io_all(s->fd, &tag, 1, false) && tag == S_FINAL) {
+        uint8_t fin[10];
+        io_all(s->fd, fin, sizeof(fin), false); /* ack */
+    }
+}
+
 static uint64_t gpusim_do_read(void *opaque, hwaddr addr, unsigned size, uint8_t region)
 {
     GpusimState *s = opaque;
@@ -274,6 +296,18 @@ static void gpusim_exit(PCIDevice *pdev)
     }
 }
 
+/* QEMU stays the config-space authority (COMMAND, BARs, MSI-X); we additionally
+ * mirror the COMMAND register to the model so its referee can enforce the PCI
+ * bring-up invariants (Bus Master / Memory Space enable). */
+static void gpusim_write_config(PCIDevice *pdev, uint32_t addr, uint32_t val, int len)
+{
+    GpusimState *s = GPUSIM(pdev);
+    pci_default_write_config(pdev, addr, val, len);
+    if (addr <= PCI_COMMAND && addr + len > PCI_COMMAND) {
+        gpusim_config_forward(s, PCI_COMMAND, pci_get_word(pdev->config + PCI_COMMAND));
+    }
+}
+
 static const Property gpusim_properties[] = {
     DEFINE_PROP_STRING("socket", GpusimState, socket_path),
 };
@@ -285,6 +319,7 @@ static void gpusim_class_init(ObjectClass *klass, const void *data)
 
     k->realize = gpusim_realize;
     k->exit = gpusim_exit;
+    k->config_write = gpusim_write_config;
     k->vendor_id = GPUSIM_VENDOR_ID;
     k->device_id = GPUSIM_DEVICE_ID;
     k->revision = 0x00;
