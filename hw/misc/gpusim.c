@@ -36,7 +36,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GpusimState, GPUSIM)
 #define GPUSIM_DEVICE_ID 0x7550
 
 #define GPUSIM_VRAM_BAR_SIZE (256ull * 1024 * 1024)
-#define GPUSIM_DOORBELL_BAR_SIZE 0x1000ull
+#define GPUSIM_DOORBELL_BAR_SIZE 0x10000ull	/* 16 pages: one doorbell page per queue */
 #define GPUSIM_REGS_BAR_SIZE 0x40000ull
 #define GPUSIM_MSIX_BAR 4
 #define GPUSIM_NUM_MSIX 8
