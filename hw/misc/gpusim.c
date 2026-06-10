@@ -21,6 +21,7 @@
 #include "hw/pci/msix.h"
 #include "hw/core/qdev-properties.h"
 #include "qom/object.h"
+#include "qemu/timer.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -41,6 +42,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(GpusimState, GPUSIM)
 #define GPUSIM_MSIX_BAR 4
 #define GPUSIM_NUM_MSIX 8
 
+/* Display block: its aperture in the REGS BAR + the live-tier vblank tick. The
+ * model (engine/src/display.rs) owns the deterministic timing; this host timer
+ * only paces the *live* in-VM refresh (doc §6 two-tier time). Writing
+ * VBLANK_TICK advances the model one frame — a no-op before SET_MODE. */
+#define GPUSIM_APER_DISP 0x30000ull       /* matches device::regs::APER_DISP */
+#define GPUSIM_DISP_VBLANK_TICK 0x30ull   /* matches display::regs::VBLANK_TICK */
+#define GPUSIM_VBLANK_PERIOD_NS 16666667ull /* ~60 Hz live refresh */
+
 /* framed protocol (see server/src/lib.rs) */
 #define C_REGION 0x01
 #define C_DMA_REPLY 0x05
@@ -56,6 +65,7 @@ struct GpusimState {
     MemoryRegion bar_regs;
     char *socket_path;
     int fd;
+    QEMUTimer *vblank_timer; /* live-tier display refresh; pulses VBLANK_TICK */
 };
 
 static void put_le64(uint8_t *p, uint64_t v)
@@ -243,6 +253,27 @@ static const MemoryRegionOps regs_ops = {
     .valid = { .min_access_size = 4, .max_access_size = 4 },
 };
 
+/* Live-tier display refresh: pulse the model's VBLANK_TICK at ~60 Hz, then
+ * re-arm. The model advances one frame (latching a pending flip); before
+ * SET_MODE it is a no-op. The deterministic timing lives in the engine tests —
+ * this only makes the in-VM driver run against a real-ish refresh. */
+static void gpusim_vblank_tick(void *opaque)
+{
+    GpusimState *s = opaque;
+    if (s->fd < 0) {
+        return;
+    }
+    bool irq = false;
+    uint8_t vec = 0;
+    gpusim_region(s, GPUSIM_BAR_REGS, true, 4,
+                  GPUSIM_APER_DISP + GPUSIM_DISP_VBLANK_TICK, 1, &irq, &vec);
+    if (irq) {
+        msix_notify(PCI_DEVICE(s), vec);
+    }
+    timer_mod(s->vblank_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GPUSIM_VBLANK_PERIOD_NS);
+}
+
 static void gpusim_realize(PCIDevice *pdev, Error **errp)
 {
     GpusimState *s = GPUSIM(pdev);
@@ -284,11 +315,21 @@ static void gpusim_realize(PCIDevice *pdev, Error **errp)
     for (int i = 0; i < GPUSIM_NUM_MSIX; i++) {
         msix_vector_use(pdev, i);
     }
+
+    /* Start the live display refresh (the model paces deterministic time itself
+     * in engine tests; in-VM the host timer drives vblank — doc §6). */
+    s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gpusim_vblank_tick, s);
+    timer_mod(s->vblank_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GPUSIM_VBLANK_PERIOD_NS);
 }
 
 static void gpusim_exit(PCIDevice *pdev)
 {
     GpusimState *s = GPUSIM(pdev);
+    if (s->vblank_timer) {
+        timer_free(s->vblank_timer);
+        s->vblank_timer = NULL;
+    }
     msix_uninit_exclusive_bar(pdev);
     if (s->fd >= 0) {
         close(s->fd);
