@@ -21,7 +21,7 @@
 #include "hw/pci/msix.h"
 #include "hw/core/qdev-properties.h"
 #include "qom/object.h"
-#include "qemu/timer.h"
+#include "ui/console.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -37,23 +37,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(GpusimState, GPUSIM)
 #define GPUSIM_DEVICE_ID 0x7550
 
 #define GPUSIM_VRAM_BAR_SIZE (256ull * 1024 * 1024)
-#define GPUSIM_DOORBELL_BAR_SIZE 0x10000ull	/* 16 pages: one doorbell page per queue */
-#define GPUSIM_REGS_BAR_SIZE 0x80000ull	/* 512 KiB: GC/OSS/SIM/DISP(0x30000)/SCHED(0x40000) apertures */
+#define GPUSIM_DOORBELL_BAR_SIZE 0x1000ull
+/* Cover all register apertures incl. APER_SCHED (0x4_0000) and APER_PGATE
+ * (0x5_0000); 512 KiB, power-of-two for the PCI BAR. */
+#define GPUSIM_REGS_BAR_SIZE 0x80000ull
 #define GPUSIM_MSIX_BAR 4
 #define GPUSIM_NUM_MSIX 8
-
-/* Display block: its aperture in the REGS BAR + the live-tier vblank tick. The
- * model (engine/src/display.rs) owns the deterministic timing; this host timer
- * only paces the *live* in-VM refresh (doc §6 two-tier time). Writing
- * VBLANK_TICK advances the model one frame — a no-op before SET_MODE. */
-#define GPUSIM_APER_DISP 0x30000ull       /* matches device::regs::APER_DISP */
-#define GPUSIM_DISP_VBLANK_TICK 0x30ull   /* matches display::regs::VBLANK_TICK */
-#define GPUSIM_VBLANK_PERIOD_NS 16666667ull /* ~60 Hz live refresh */
 
 /* framed protocol (see server/src/lib.rs) */
 #define C_REGION 0x01
 #define C_DMA_REPLY 0x05
 #define C_CONFIG_WRITE 0x07
+#define C_SCANOUT 0x08
 #define S_DMA_READ 0x81
 #define S_DMA_WRITE 0x82
 #define S_FINAL 0x83
@@ -65,7 +60,9 @@ struct GpusimState {
     MemoryRegion bar_regs;
     char *socket_path;
     int fd;
-    QEMUTimer *vblank_timer; /* live-tier display refresh; pulses VBLANK_TICK */
+    QemuConsole *con;        /* display console — makes the modeled scanout visible */
+    DisplaySurface *surface; /* current presented surface */
+    int cur_w, cur_h;        /* its dims, to re-create on a mode change */
 };
 
 static void put_le64(uint8_t *p, uint64_t v)
@@ -253,26 +250,65 @@ static const MemoryRegionOps regs_ops = {
     .valid = { .min_access_size = 4, .max_access_size = 4 },
 };
 
-/* Live-tier display refresh: pulse the model's VBLANK_TICK at ~60 Hz, then
- * re-arm. The model advances one frame (latching a pending flip); before
- * SET_MODE it is a no-op. The deterministic timing lives in the engine tests —
- * this only makes the in-VM driver run against a real-ish refresh. */
-static void gpusim_vblank_tick(void *opaque)
+/* Display refresh hook: pull the current scanout FB from the model in one bulk
+ * C_SCANOUT transfer and blit it to the console surface. THIS is what makes the
+ * modeled display visible — without it the gpusim display path is readback-only.
+ * Runs under the BQL (like the MMIO path), so the framed socket protocol is
+ * never interleaved between the two. */
+static void gpusim_gfx_update(void *opaque)
 {
     GpusimState *s = opaque;
     if (s->fd < 0) {
         return;
     }
-    bool irq = false;
-    uint8_t vec = 0;
-    gpusim_region(s, GPUSIM_BAR_REGS, true, 4,
-                  GPUSIM_APER_DISP + GPUSIM_DISP_VBLANK_TICK, 1, &irq, &vec);
-    if (irq) {
-        msix_notify(PCI_DEVICE(s), vec);
+
+    uint8_t op = C_SCANOUT;
+    if (!io_all(s->fd, &op, 1, true)) {
+        return;
     }
-    timer_mod(s->vblank_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GPUSIM_VBLANK_PERIOD_NS);
+    uint8_t present = 0;
+    if (!io_all(s->fd, &present, 1, false) || !present) {
+        return; /* no FB programmed yet — leave the surface as-is */
+    }
+    uint8_t hdr[12];
+    if (!io_all(s->fd, hdr, sizeof(hdr), false)) {
+        return;
+    }
+    uint32_t w = get_le32(hdr);
+    uint32_t h = get_le32(hdr + 4);
+    uint32_t len = get_le32(hdr + 8);
+    if (w == 0 || h == 0 || len == 0) {
+        return;
+    }
+    uint8_t *fb = g_malloc(len);
+    if (!io_all(s->fd, fb, len, false)) {
+        g_free(fb);
+        return;
+    }
+
+    /* (Re)create the surface when the mode changes. */
+    if (!s->surface || s->cur_w != (int)w || s->cur_h != (int)h) {
+        s->surface = qemu_create_displaysurface(w, h);
+        dpy_gfx_replace_surface(s->con, s->surface);
+        s->cur_w = (int)w;
+        s->cur_h = (int)h;
+    }
+
+    /* Blit. The QEMU surface is x8r8g8b8 (B,G,R,X in LE memory); the scanout BO
+     * is assumed to already be in that byte order (the efifb BGRA convention).
+     * If colours come out swapped at first light, swizzle R<->B here. */
+    uint8_t *dst = surface_data(s->surface);
+    size_t fb_bytes = (size_t)w * h * 4;
+    size_t n = len < fb_bytes ? len : fb_bytes;
+    memcpy(dst, fb, n);
+    g_free(fb);
+
+    dpy_gfx_update_full(s->con);
 }
+
+static const GraphicHwOps gpusim_gfx_ops = {
+    .gfx_update = gpusim_gfx_update,
+};
 
 static void gpusim_realize(PCIDevice *pdev, Error **errp)
 {
@@ -316,20 +352,15 @@ static void gpusim_realize(PCIDevice *pdev, Error **errp)
         msix_vector_use(pdev, i);
     }
 
-    /* Start the live display refresh (the model paces deterministic time itself
-     * in engine tests; in-VM the host timer drives vblank — doc §6). */
-    s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gpusim_vblank_tick, s);
-    timer_mod(s->vblank_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GPUSIM_VBLANK_PERIOD_NS);
+    /* Register a display console so the modeled scanout is actually presented
+     * (pulled from VRAM each refresh by gpusim_gfx_update). With -display cocoa
+     * this is the visible window; headless runs simply never call gfx_update. */
+    s->con = graphic_console_init(DEVICE(pdev), 0, &gpusim_gfx_ops, s);
 }
 
 static void gpusim_exit(PCIDevice *pdev)
 {
     GpusimState *s = GPUSIM(pdev);
-    if (s->vblank_timer) {
-        timer_free(s->vblank_timer);
-        s->vblank_timer = NULL;
-    }
     msix_uninit_exclusive_bar(pdev);
     if (s->fd >= 0) {
         close(s->fd);
