@@ -23,6 +23,7 @@
 #include "qom/object.h"
 #include "ui/console.h"
 #include "qemu/timer.h"
+#include "qemu/thread.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -80,6 +81,10 @@ struct GpusimState {
     DisplaySurface *surface; /* current presented surface */
     int cur_w, cur_h;        /* its dims, to re-create on a mode change */
     QEMUTimer *vblank_timer; /* live-tier display refresh; pulses VBLANK_TICK */
+    QemuMutex sock_lock;     /* serialize whole socket transactions: a vCPU MMIO
+                              * C_REGION must not interleave with the main-loop
+                              * gfx_update's C_SCANOUT (a 1 MiB+ reply) — they run
+                              * on different threads and would desync the framing. */
 };
 
 static void put_le64(uint8_t *p, uint64_t v)
@@ -230,7 +235,10 @@ static uint64_t gpusim_do_read(void *opaque, hwaddr addr, unsigned size, uint8_t
     GpusimState *s = opaque;
     bool irq = false;
     uint8_t vec = 0;
-    uint64_t v = gpusim_region(s, region, false, size, addr, 0, &irq, &vec);
+    uint64_t v;
+    qemu_mutex_lock(&s->sock_lock);
+    v = gpusim_region(s, region, false, size, addr, 0, &irq, &vec);
+    qemu_mutex_unlock(&s->sock_lock);
     if (irq) {
         msix_notify(PCI_DEVICE(s), vec);
     }
@@ -242,7 +250,9 @@ static void gpusim_do_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
     GpusimState *s = opaque;
     bool irq = false;
     uint8_t vec = 0;
+    qemu_mutex_lock(&s->sock_lock);
     gpusim_region(s, region, true, size, addr, val, &irq, &vec);
+    qemu_mutex_unlock(&s->sock_lock);
     if (irq) {
         msix_notify(PCI_DEVICE(s), vec);
     }
@@ -270,8 +280,11 @@ static const MemoryRegionOps regs_ops = {
 /* Display refresh hook: pull the current scanout FB from the model in one bulk
  * C_SCANOUT transfer and blit it to the console surface. THIS is what makes the
  * modeled display visible — without it the gpusim display path is readback-only.
- * Runs under the BQL (like the MMIO path), so the framed socket protocol is
- * never interleaved between the two. */
+ * The C_SCANOUT reply is large (a full framebuffer); the whole socket transaction
+ * is taken under sock_lock so a concurrent vCPU MMIO C_REGION can't interleave
+ * with it on the wire (gfx_update runs on the main loop, MMIO on the vCPU thread —
+ * they are NOT mutually exclusive under HVF, and an interleave desyncs the framing,
+ * silently dropping register writes). */
 static void gpusim_gfx_update(void *opaque)
 {
     GpusimState *s = opaque;
@@ -279,28 +292,34 @@ static void gpusim_gfx_update(void *opaque)
         return;
     }
 
+    uint32_t w = 0, h = 0, len = 0;
+    uint8_t *fb = NULL;
+
+    /* Socket transaction (request + full reply) under the lock. */
+    qemu_mutex_lock(&s->sock_lock);
     uint8_t op = C_SCANOUT;
-    if (!io_all(s->fd, &op, 1, true)) {
-        return;
+    if (io_all(s->fd, &op, 1, true)) {
+        uint8_t present = 0;
+        if (io_all(s->fd, &present, 1, false) && present) {
+            uint8_t hdr[12];
+            if (io_all(s->fd, hdr, sizeof(hdr), false)) {
+                w = get_le32(hdr);
+                h = get_le32(hdr + 4);
+                len = get_le32(hdr + 8);
+                if (w != 0 && h != 0 && len != 0) {
+                    fb = g_malloc(len);
+                    if (!io_all(s->fd, fb, len, false)) {
+                        g_free(fb);
+                        fb = NULL;
+                    }
+                }
+            }
+        }
     }
-    uint8_t present = 0;
-    if (!io_all(s->fd, &present, 1, false) || !present) {
-        return; /* no FB programmed yet — leave the surface as-is */
-    }
-    uint8_t hdr[12];
-    if (!io_all(s->fd, hdr, sizeof(hdr), false)) {
-        return;
-    }
-    uint32_t w = get_le32(hdr);
-    uint32_t h = get_le32(hdr + 4);
-    uint32_t len = get_le32(hdr + 8);
-    if (w == 0 || h == 0 || len == 0) {
-        return;
-    }
-    uint8_t *fb = g_malloc(len);
-    if (!io_all(s->fd, fb, len, false)) {
-        g_free(fb);
-        return;
+    qemu_mutex_unlock(&s->sock_lock);
+
+    if (fb == NULL) {
+        return; /* no FB programmed / transfer failed — leave the surface as-is */
     }
 
     /* (Re)create the surface when the mode changes. */
@@ -340,8 +359,10 @@ static void gpusim_vblank_tick(void *opaque)
     if (s->fd < 0) {
         return;
     }
+    qemu_mutex_lock(&s->sock_lock);
     gpusim_region(s, GPUSIM_BAR_REGS, true, 4,
                   GPUSIM_APER_DISP + GPUSIM_DISP_VBLANK_TICK, 1, &irq, &vec);
+    qemu_mutex_unlock(&s->sock_lock);
     if (irq) {
         msix_notify(PCI_DEVICE(s), vec);
     }
@@ -353,6 +374,7 @@ static void gpusim_realize(PCIDevice *pdev, Error **errp)
 {
     GpusimState *s = GPUSIM(pdev);
 
+    qemu_mutex_init(&s->sock_lock);
     s->fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (s->fd < 0) {
         error_setg_errno(errp, errno, "gpusim: socket()");
