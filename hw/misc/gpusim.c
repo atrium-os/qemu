@@ -38,7 +38,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(GpusimState, GPUSIM)
 #define GPUSIM_DEVICE_ID 0x7550
 
 #define GPUSIM_VRAM_BAR_SIZE (256ull * 1024 * 1024)
-#define GPUSIM_DOORBELL_BAR_SIZE 0x1000ull
+/* The doorbell BAR holds one page per queue: GFX at page 0, COMPUTE at page 1
+ * (offset 0x1000), and a page per user-mode queue beyond that. It MUST be large
+ * enough that a write to any queue's doorbell page stays in-BAR — a 0x1000
+ * (single-page) BAR let the COMPUTE doorbell at 0x1000 overflow into the
+ * adjacent MSI-X table, corrupting the vector-0 message address so every
+ * interrupt after the first was misrouted. 4 MiB matches the model's advertised
+ * BAR2 size (engine/src/device_adapter.rs) and covers 1024 doorbell pages. */
+#define GPUSIM_DOORBELL_BAR_SIZE (4ull * 1024 * 1024)
 /* Cover all register apertures incl. APER_SCHED (0x4_0000) and APER_PGATE
  * (0x5_0000); 512 KiB, power-of-two for the PCI BAR. */
 #define GPUSIM_REGS_BAR_SIZE 0x80000ull
