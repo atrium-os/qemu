@@ -366,6 +366,13 @@ static void gpusim_vblank_tick(void *opaque)
     if (irq) {
         msix_notify(PCI_DEVICE(s), vec);
     }
+    /* Drive the console refresh each vblank: a static scanout (a compositor that
+     * drew once and is now idle) produces no display updates, so -display cocoa
+     * wouldn't repaint it until forced (e.g. a console switch). graphic_hw_update
+     * re-runs gpusim_gfx_update (re-blit + full-dirty) so the latched frame stays
+     * on screen at ~60 Hz with no nudge. It takes sock_lock internally, so it must
+     * be OUTSIDE the lock above. */
+    graphic_hw_update(s->con);
     timer_mod(s->vblank_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GPUSIM_VBLANK_PERIOD_NS);
 }
