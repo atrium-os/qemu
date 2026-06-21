@@ -66,9 +66,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(GpusimState, GPUSIM)
 #define C_DMA_REPLY 0x05
 #define C_CONFIG_WRITE 0x07
 #define C_SCANOUT 0x08
+#define C_DELIVER_EOP 0x09   /* host -> model: deliver the oldest deferred EOP */
 #define S_DMA_READ 0x81
 #define S_DMA_WRITE 0x82
 #define S_FINAL 0x83
+#define S_DEFER 0x84         /* model -> host: defer this EOP by delay_ns */
 
 struct GpusimState {
     PCIDevice parent_obj;
@@ -85,6 +87,13 @@ struct GpusimState {
                               * C_REGION must not interleave with the main-loop
                               * gfx_update's C_SCANOUT (a 1 MiB+ reply) — they run
                               * on different threads and would desync the framing. */
+    /* Shaping (gpu-device-model.md): EOP completions deferred by the modeled
+     * render time. eop_due is a FIFO of fire-at timestamps (ns, QEMU_CLOCK_VIRTUAL);
+     * render_busy_until chains them onto the serial engine tail; eop_timer fires
+     * the head, delivering it via C_DELIVER_EOP. */
+    QEMUTimer *eop_timer;
+    GQueue *eop_due;             /* malloc'd uint64_t fire-at times, FIFO */
+    uint64_t render_busy_until_ns;
 };
 
 static void put_le64(uint8_t *p, uint64_t v)
@@ -130,30 +139,30 @@ static bool io_all(int fd, void *buf, size_t n, bool writing)
     return true;
 }
 
-/* Send a REGION access, then service the model's DMA requests (translating them
- * to guest-memory access via pci_dma) until the FINAL frame. Returns read data;
- * sets the irq/vec out-params if the model raised an interrupt. */
-static uint64_t gpusim_region(GpusimState *s, uint8_t region, bool write_acc,
-                              uint8_t len, uint64_t offset, uint64_t data,
-                              bool *irq, uint8_t *vec)
+/* Shaping: queue a deferred EOP to fire `delay_ns` of modeled render time after
+ * the serial engine reaches it. render_busy_until chains successive EOPs (the
+ * engine is one FIFO), so fire times are monotonic; the timer tracks the head.
+ * Called from the drain loop (under sock_lock). */
+static void gpusim_eop_enqueue(GpusimState *s, uint64_t delay_ns)
 {
-    if (irq) {
-        *irq = false;
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t base = s->render_busy_until_ns > now ? s->render_busy_until_ns : now;
+    uint64_t fire_at = base + delay_ns;
+    s->render_busy_until_ns = fire_at;
+    bool was_empty = g_queue_is_empty(s->eop_due);
+    uint64_t *slot = g_new(uint64_t, 1);
+    *slot = fire_at;
+    g_queue_push_tail(s->eop_due, slot);
+    if (was_empty) {
+        timer_mod(s->eop_timer, fire_at);
     }
-    if (s->fd < 0) {
-        return 0;
-    }
-    uint8_t req[20];
-    req[0] = C_REGION;
-    req[1] = region;
-    req[2] = write_acc ? 1 : 0;
-    req[3] = len;
-    put_le64(req + 4, offset);
-    put_le64(req + 12, data);
-    if (!io_all(s->fd, req, sizeof(req), true)) {
-        return 0;
-    }
+}
 
+/* Service the model's DMA round-trips + shaping deferrals until the FINAL frame.
+ * Returns read data; sets the irq/vec out-params from FINAL. Shared by C_REGION
+ * and C_DELIVER_EOP (whichever request the caller already sent). */
+static uint64_t gpusim_drain(GpusimState *s, bool *irq, uint8_t *vec)
+{
     for (;;) {
         uint8_t tag;
         if (!io_all(s->fd, &tag, 1, false)) {
@@ -191,6 +200,12 @@ static uint64_t gpusim_region(GpusimState *s, uint8_t region, bool write_acc,
             g_free(buf);
             uint8_t rep[6] = { C_DMA_REPLY, 0, 0, 0, 0, 0 };
             io_all(s->fd, rep, sizeof(rep), true);
+        } else if (tag == S_DEFER) {
+            uint8_t d[8];
+            if (!io_all(s->fd, d, sizeof(d), false)) {
+                return 0;
+            }
+            gpusim_eop_enqueue(s, get_le64(d));
         } else if (tag == S_FINAL) {
             uint8_t fin[10];
             if (!io_all(s->fd, fin, sizeof(fin), false)) {
@@ -207,6 +222,31 @@ static uint64_t gpusim_region(GpusimState *s, uint8_t region, bool write_acc,
             return 0;
         }
     }
+}
+
+/* Send a REGION access, then service the model's requests until FINAL. Returns
+ * read data; sets the irq/vec out-params if the model raised an interrupt. */
+static uint64_t gpusim_region(GpusimState *s, uint8_t region, bool write_acc,
+                              uint8_t len, uint64_t offset, uint64_t data,
+                              bool *irq, uint8_t *vec)
+{
+    if (irq) {
+        *irq = false;
+    }
+    if (s->fd < 0) {
+        return 0;
+    }
+    uint8_t req[20];
+    req[0] = C_REGION;
+    req[1] = region;
+    req[2] = write_acc ? 1 : 0;
+    req[3] = len;
+    put_le64(req + 4, offset);
+    put_le64(req + 12, data);
+    if (!io_all(s->fd, req, sizeof(req), true)) {
+        return 0;
+    }
+    return gpusim_drain(s, irq, vec);
 }
 
 /* Forward a config-space dword write to the model (offset:u64 value:u32), then
@@ -377,11 +417,55 @@ static void gpusim_vblank_tick(void *opaque)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GPUSIM_VBLANK_PERIOD_NS);
 }
 
+/* Ask the model to deliver the oldest deferred EOP — it writes the IH cookie via
+ * DMA + raises MSI-X (reported in FINAL). Caller holds sock_lock. */
+static uint64_t gpusim_deliver_eop(GpusimState *s, bool *irq, uint8_t *vec)
+{
+    if (irq) {
+        *irq = false;
+    }
+    if (s->fd < 0) {
+        return 0;
+    }
+    uint8_t req = C_DELIVER_EOP;
+    if (!io_all(s->fd, &req, 1, true)) {
+        return 0;
+    }
+    return gpusim_drain(s, irq, vec);
+}
+
+/* A deferral timer expired: deliver the head EOP + msix_notify, then re-arm for
+ * the next queued EOP (FIFO; fire times are monotonic, so the head is earliest). */
+static void gpusim_eop_fire(void *opaque)
+{
+    GpusimState *s = opaque;
+    bool irq = false;
+    uint8_t vec = 0;
+
+    if (s->fd < 0) {
+        return;
+    }
+    qemu_mutex_lock(&s->sock_lock);
+    gpusim_deliver_eop(s, &irq, &vec);
+    qemu_mutex_unlock(&s->sock_lock);
+    if (irq) {
+        msix_notify(PCI_DEVICE(s), vec);
+    }
+    uint64_t *done = g_queue_pop_head(s->eop_due);
+    g_free(done);
+    if (!g_queue_is_empty(s->eop_due)) {
+        uint64_t *next = g_queue_peek_head(s->eop_due);
+        timer_mod(s->eop_timer, *next);
+    }
+}
+
 static void gpusim_realize(PCIDevice *pdev, Error **errp)
 {
     GpusimState *s = GPUSIM(pdev);
 
     qemu_mutex_init(&s->sock_lock);
+    s->eop_due = g_queue_new();
+    s->render_busy_until_ns = 0;
     s->fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (s->fd < 0) {
         error_setg_errno(errp, errno, "gpusim: socket()");
@@ -431,6 +515,9 @@ static void gpusim_realize(PCIDevice *pdev, Error **errp)
     s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gpusim_vblank_tick, s);
     timer_mod(s->vblank_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GPUSIM_VBLANK_PERIOD_NS);
+
+    /* Shaping deferral timer (armed on demand by gpusim_eop_enqueue). */
+    s->eop_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gpusim_eop_fire, s);
 }
 
 static void gpusim_exit(PCIDevice *pdev)
