@@ -76,7 +76,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GpusimState, GPUSIM)
 
 /* Decoupled-MES coalescing window: re-armed on each doorbell, so a burst of
  * submissions accumulates and the MES tick runs them once the burst goes idle. */
-#define GPUSIM_MES_WINDOW_NS 50000ull /* 50 µs idle → schedule */
+#define GPUSIM_MES_WINDOW_NS 50000000ull /* 50 ms idle → schedule (reliably coalesces a submit burst) */
 
 struct GpusimState {
     PCIDevice parent_obj;
