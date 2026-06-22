@@ -67,10 +67,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(GpusimState, GPUSIM)
 #define C_CONFIG_WRITE 0x07
 #define C_SCANOUT 0x08
 #define C_DELIVER_EOP 0x09   /* host -> model: deliver the oldest deferred EOP */
+#define C_MES_RUN 0x0a       /* host -> model: MES timer fired, run ready queues */
 #define S_DMA_READ 0x81
 #define S_DMA_WRITE 0x82
 #define S_FINAL 0x83
 #define S_DEFER 0x84         /* model -> host: defer this EOP by delay_ns */
+#define S_MES_PENDING 0x85   /* model -> host: a doorbell enqueued; arm the MES tick */
+
+/* Decoupled-MES coalescing window: re-armed on each doorbell, so a burst of
+ * submissions accumulates and the MES tick runs them once the burst goes idle. */
+#define GPUSIM_MES_WINDOW_NS 50000ull /* 50 µs idle → schedule */
 
 struct GpusimState {
     PCIDevice parent_obj;
@@ -94,6 +100,10 @@ struct GpusimState {
     QEMUTimer *eop_timer;
     GQueue *eop_due;             /* malloc'd uint64_t fire-at times, FIFO */
     uint64_t render_busy_until_ns;
+    /* Decoupled MES: a doorbell enqueued work (S_MES_PENDING); the mes_timer,
+     * re-armed on each doorbell, runs the ready queues once the burst goes idle. */
+    QEMUTimer *mes_timer;
+    bool mes_pending;
 };
 
 static void put_le64(uint8_t *p, uint64_t v)
@@ -206,6 +216,8 @@ static uint64_t gpusim_drain(GpusimState *s, bool *irq, uint8_t *vec)
                 return 0;
             }
             gpusim_eop_enqueue(s, get_le64(d));
+        } else if (tag == S_MES_PENDING) {
+            s->mes_pending = true; /* do_write re-arms the MES tick after this */
         } else if (tag == S_FINAL) {
             uint8_t fin[10];
             if (!io_all(s->fd, fin, sizeof(fin), false)) {
@@ -292,9 +304,17 @@ static void gpusim_do_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
     uint8_t vec = 0;
     qemu_mutex_lock(&s->sock_lock);
     gpusim_region(s, region, true, size, addr, val, &irq, &vec);
+    bool mes = s->mes_pending;
+    s->mes_pending = false;
     qemu_mutex_unlock(&s->sock_lock);
     if (irq) {
         msix_notify(PCI_DEVICE(s), vec);
+    }
+    /* Decoupled MES: a doorbell enqueued work — (re)arm the MES tick. Re-arming on
+     * each doorbell coalesces a submission burst; it fires once the burst is idle. */
+    if (mes) {
+        timer_mod(s->mes_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GPUSIM_MES_WINDOW_NS);
     }
 }
 
@@ -459,6 +479,44 @@ static void gpusim_eop_fire(void *opaque)
     }
 }
 
+/* Ask the model to run its ready queues (decoupled MES tick). The drain handles
+ * the resulting fence DMAs + shaping deferrals (S_DEFER) + FINAL irq. Caller holds
+ * sock_lock. */
+static uint64_t gpusim_mes_run(GpusimState *s, bool *irq, uint8_t *vec)
+{
+    if (irq) {
+        *irq = false;
+    }
+    if (s->fd < 0) {
+        return 0;
+    }
+    uint8_t req = C_MES_RUN;
+    if (!io_all(s->fd, &req, 1, true)) {
+        return 0;
+    }
+    return gpusim_drain(s, irq, vec);
+}
+
+/* The MES timer fired: run the accumulated submissions (the model schedules them
+ * earliest-deadline-first). Any immediate EOP IRQ is delivered now; shaping EOPs
+ * were queued on the eop_timer by the drain's S_DEFER handling. */
+static void gpusim_mes_fire(void *opaque)
+{
+    GpusimState *s = opaque;
+    bool irq = false;
+    uint8_t vec = 0;
+
+    if (s->fd < 0) {
+        return;
+    }
+    qemu_mutex_lock(&s->sock_lock);
+    gpusim_mes_run(s, &irq, &vec);
+    qemu_mutex_unlock(&s->sock_lock);
+    if (irq) {
+        msix_notify(PCI_DEVICE(s), vec);
+    }
+}
+
 static void gpusim_realize(PCIDevice *pdev, Error **errp)
 {
     GpusimState *s = GPUSIM(pdev);
@@ -466,6 +524,7 @@ static void gpusim_realize(PCIDevice *pdev, Error **errp)
     qemu_mutex_init(&s->sock_lock);
     s->eop_due = g_queue_new();
     s->render_busy_until_ns = 0;
+    s->mes_pending = false;
     s->fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (s->fd < 0) {
         error_setg_errno(errp, errno, "gpusim: socket()");
@@ -518,6 +577,8 @@ static void gpusim_realize(PCIDevice *pdev, Error **errp)
 
     /* Shaping deferral timer (armed on demand by gpusim_eop_enqueue). */
     s->eop_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gpusim_eop_fire, s);
+    /* Decoupled-MES tick (armed on demand by a doorbell in MES mode). */
+    s->mes_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gpusim_mes_fire, s);
 }
 
 static void gpusim_exit(PCIDevice *pdev)
