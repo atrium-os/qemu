@@ -81,7 +81,14 @@ static int wav_init_out(HWVoiceOut *hw, struct audsettings *as)
     };
     Audiodev *dev = hw->s->dev;
     AudiodevWavOptions *wopts = &dev->u.wav;
-    struct audsettings wav_as = audiodev_to_audsettings(dev->u.wav.out);
+    /*
+     * Without the mixing engine the device's samples are written as they are,
+     * so the file takes the voice's own format and is consumed at its rate.
+     * (The audiodev's out.* settings may not be given then, and their 44.1 kHz
+     * default would drain a 48 kHz device too slowly and drop its samples.)
+     */
+    struct audsettings wav_as = audio_get_pdo_out(dev)->mixing_engine ?
+        audiodev_to_audsettings(dev->u.wav.out) : *as;
     const char *wav_path = wopts->path ?: "qemu.wav";
 
     stereo = wav_as.nchannels == 2;
