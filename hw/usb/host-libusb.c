@@ -511,8 +511,16 @@ static void usb_host_req_abort(USBHostRequest *r)
         } else {
             usb_packet_complete(USB_DEVICE(s), r->p);
         }
+    }
+    /*
+     * Whatever state the packet is in, the request must stop pointing at it:
+     * the controller frees its packets when the device detaches, and a
+     * transfer libusb completes after that would otherwise write to and
+     * dereference freed memory (seen as a NULL p->ep in
+     * usb_host_use_combining() after a device vanished mid-transfer).
+     */
+    if (r->p) {
         r->p = NULL;
-
         libusb_cancel_transfer(r->xfer);
     }
 }
@@ -1364,6 +1372,9 @@ static int usb_host_claim_interfaces(USBHostDevice *s, int configuration)
         rc = libusb_set_configuration(s->dh, configuration);
         usb_host_libusb_error("libusb_set_configuration", rc);
         if (rc != 0) {
+            if (rc == LIBUSB_ERROR_NO_DEVICE) {
+                usb_host_nodev(s);
+            }
             return USB_RET_STALL;
         }
         usb_host_detach_kernel(s);
