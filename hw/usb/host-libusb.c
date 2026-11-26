@@ -1353,9 +1353,25 @@ static int usb_host_claim_interfaces(USBHostDevice *s, int configuration)
     usb_host_detach_kernel(s);
 
     rc = libusb_get_active_config_descriptor(s->dev, &conf);
+    if (rc == LIBUSB_ERROR_NOT_FOUND && configuration != 0) {
+        /*
+         * The host left the device unconfigured (macOS does this for devices
+         * no kernel driver claims, e.g. class 0xE0 Bluetooth controllers),
+         * and usb_host_set_config() skips SET_CONFIGURATION for devices with
+         * one configuration. Claiming nothing here would leave every endpoint
+         * stalled, so configure it as the guest asked and claim that.
+         */
+        rc = libusb_set_configuration(s->dh, configuration);
+        usb_host_libusb_error("libusb_set_configuration", rc);
+        if (rc != 0) {
+            return USB_RET_STALL;
+        }
+        usb_host_detach_kernel(s);
+        rc = libusb_get_active_config_descriptor(s->dev, &conf);
+    }
     if (rc != 0) {
         if (rc == LIBUSB_ERROR_NOT_FOUND) {
-            /* address state - ignore */
+            /* address state (the guest asked for configuration 0) */
             return USB_RET_SUCCESS;
         }
         return USB_RET_STALL;
@@ -1373,6 +1389,7 @@ static int usb_host_claim_interfaces(USBHostDevice *s, int configuration)
         }
     }
     if (claimed != conf->bNumInterfaces) {
+        libusb_free_config_descriptor(conf);
         return USB_RET_STALL;
     }
 
