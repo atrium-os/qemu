@@ -86,6 +86,9 @@ struct USBHostDevice {
     struct USBAutoFilter             match;
     char                             *hostdevice;
     int32_t                          bootindex;
+    bool                             isodebug;
+    char                             *isotap;
+    int                              isotap_fd;
     uint32_t                         iso_urb_count;
     uint32_t                         iso_urb_frames;
     uint32_t                         options;
@@ -146,6 +149,10 @@ struct USBHostIsoXfer {
 struct USBHostIsoRing {
     USBHostDevice                    *host;
     USBEndpoint                      *ep;
+    QEMUTimer                        *report_timer;
+    struct {
+        uint64_t received, submitted, dropped, starts, stops, truncated, empty;
+    } stats;
     QTAILQ_HEAD(, USBHostIsoXfer)    unused;
     QTAILQ_HEAD(, USBHostIsoXfer)    inflight;
     QTAILQ_HEAD(, USBHostIsoXfer)    copy;
@@ -542,6 +549,9 @@ usb_host_req_complete_iso(struct libusb_transfer *transfer)
     QTAILQ_REMOVE(&xfer->ring->inflight, xfer, next);
     if (QTAILQ_EMPTY(&xfer->ring->inflight)) {
         USBHostDevice *s = xfer->ring->host;
+        if (s->isodebug) {
+            xfer->ring->stats.stops++;
+        }
         trace_usb_host_iso_stop(s->bus_num, s->addr, xfer->ring->ep->nr);
     }
     if (xfer->ring->ep->pid == USB_TOKEN_IN) {
@@ -550,6 +560,29 @@ usb_host_req_complete_iso(struct libusb_transfer *transfer)
     } else {
         QTAILQ_INSERT_TAIL(&xfer->ring->unused, xfer, next);
     }
+}
+
+static void usb_host_iso_report(USBHostIsoRing *ring)
+{
+    info_report("usb-host %d:%d ep=%02x received=%" PRIu64
+                " submitted=%" PRIu64 " dropped=%" PRIu64
+                " starts=%" PRIu64 " stops=%" PRIu64
+                " truncated=%" PRIu64 " empty_in=%" PRIu64,
+                ring->host->bus_num, ring->host->addr,
+                ring->ep->nr | (ring->ep->pid == USB_TOKEN_IN ? USB_DIR_IN : 0),
+                ring->stats.received, ring->stats.submitted,
+                ring->stats.dropped, ring->stats.starts, ring->stats.stops,
+                ring->stats.truncated, ring->stats.empty);
+    memset(&ring->stats, 0, sizeof(ring->stats));
+}
+
+static void usb_host_iso_tick(void *opaque)
+{
+    USBHostIsoRing *ring = opaque;
+
+    usb_host_iso_report(ring);
+    timer_mod(ring->report_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1000);
 }
 
 static USBHostIsoRing *usb_host_iso_alloc(USBHostDevice *s, USBEndpoint *ep)
@@ -562,6 +595,12 @@ static USBHostIsoRing *usb_host_iso_alloc(USBHostDevice *s, USBEndpoint *ep)
 
     ring->host = s;
     ring->ep = ep;
+    if (s->isodebug) {
+        ring->report_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                          usb_host_iso_tick, ring);
+        timer_mod(ring->report_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1000);
+    }
     QTAILQ_INIT(&ring->unused);
     QTAILQ_INIT(&ring->inflight);
     QTAILQ_INIT(&ring->copy);
@@ -639,6 +678,10 @@ static void usb_host_iso_free(USBHostIsoRing *ring)
         usb_host_iso_free_xfer(xfer, false);
     }
 
+    if (ring->report_timer) {
+        timer_free(ring->report_timer);
+        usb_host_iso_report(ring);
+    }
     QTAILQ_REMOVE(&ring->host->isorings, ring, next);
     g_free(ring);
 }
@@ -668,6 +711,9 @@ static bool usb_host_iso_data_copy(USBHostIsoXfer *xfer, USBPacket *p)
     } else {
         psize = xfer->xfer->iso_packet_desc[xfer->packet].actual_length;
         if (psize > p->iov.size) {
+            if (xfer->ring->host->isodebug) {
+                xfer->ring->stats.truncated++;
+            }
             /* should not happen (guest bug) */
             psize = p->iov.size;
         }
@@ -690,6 +736,10 @@ static void usb_host_iso_data_in(USBHostDevice *s, USBPacket *p)
         ring = usb_host_iso_alloc(s, p->ep);
     }
 
+    if (s->isodebug) {
+        ring->stats.received++;
+    }
+
     /* copy data to guest */
     xfer = QTAILQ_FIRST(&ring->copy);
     if (xfer != NULL) {
@@ -697,6 +747,10 @@ static void usb_host_iso_data_in(USBHostDevice *s, USBPacket *p)
             QTAILQ_REMOVE(&ring->copy, xfer, next);
             QTAILQ_INSERT_TAIL(&ring->unused, xfer, next);
         }
+    }
+
+    if (s->isodebug && p->actual_length == 0) {
+        ring->stats.empty++;
     }
 
     /* submit empty bufs to host */
@@ -712,6 +766,10 @@ static void usb_host_iso_data_in(USBHostDevice *s, USBPacket *p)
             }
             break;
         }
+        if (s->isodebug) {
+            ring->stats.submitted += s->iso_urb_frames;
+            ring->stats.starts += QTAILQ_EMPTY(&ring->inflight);
+        }
         if (QTAILQ_EMPTY(&ring->inflight)) {
             trace_usb_host_iso_start(s->bus_num, s->addr, p->ep->nr);
         }
@@ -721,6 +779,32 @@ static void usb_host_iso_data_in(USBHostDevice *s, USBPacket *p)
     if (disconnect) {
         usb_host_nodev(s);
     }
+}
+
+/*
+ * libusb owns the transfer after submit. Snapshot the descriptor-defined
+ * prefix before handing it over, and record it only if submit succeeds.
+ */
+static int usb_host_iso_submit_tapped(USBHostDevice *s,
+                                      struct libusb_transfer *transfer)
+{
+    g_autofree uint8_t *data = NULL;
+    size_t len = 0;
+    int rc;
+
+    for (int i = 0; i < transfer->num_iso_packets; i++) {
+        len += transfer->iso_packet_desc[i].length;
+    }
+    data = g_memdup2(transfer->buffer, len);
+    rc = libusb_submit_transfer(transfer);
+    if (rc == 0 && len &&
+        qemu_write_full(s->isotap_fd, data, len) != (ssize_t)len) {
+        error_report("usb-host: incomplete tap %s: %s",
+                     s->isotap, strerror(errno));
+        qemu_close(s->isotap_fd);
+        s->isotap_fd = -1;
+    }
+    return rc;
 }
 
 static void usb_host_iso_data_out(USBHostDevice *s, USBPacket *p)
@@ -735,6 +819,10 @@ static void usb_host_iso_data_out(USBHostDevice *s, USBPacket *p)
         ring = usb_host_iso_alloc(s, p->ep);
     }
 
+    if (s->isodebug) {
+        ring->stats.received++;
+    }
+
     /* copy data from guest */
     xfer = QTAILQ_FIRST(&ring->copy);
     while (xfer != NULL && xfer->copy_complete) {
@@ -744,12 +832,18 @@ static void usb_host_iso_data_out(USBHostDevice *s, USBPacket *p)
     if (xfer == NULL) {
         xfer = QTAILQ_FIRST(&ring->unused);
         if (xfer == NULL) {
+            if (s->isodebug) {
+                ring->stats.dropped++;
+            }
             trace_usb_host_iso_out_of_bufs(s->bus_num, s->addr, p->ep->nr);
             return;
         }
         QTAILQ_REMOVE(&ring->unused, xfer, next);
         usb_host_iso_reset_xfer(xfer);
         QTAILQ_INSERT_TAIL(&ring->copy, xfer, next);
+    }
+    if (s->isodebug && p->iov.size > ring->ep->max_packet_size) {
+        ring->stats.truncated++;
     }
     usb_host_iso_data_copy(xfer, p);
 
@@ -765,7 +859,11 @@ static void usb_host_iso_data_out(USBHostDevice *s, USBPacket *p)
     while ((xfer = QTAILQ_FIRST(&ring->copy)) != NULL &&
            xfer->copy_complete) {
         QTAILQ_REMOVE(&ring->copy, xfer, next);
-        rc = libusb_submit_transfer(xfer->xfer);
+        if (s->isotap_fd >= 0) {
+            rc = usb_host_iso_submit_tapped(s, xfer->xfer);
+        } else {
+            rc = libusb_submit_transfer(xfer->xfer);
+        }
         if (rc != 0) {
             usb_host_libusb_error("libusb_submit_transfer [iso]", rc);
             QTAILQ_INSERT_TAIL(&ring->unused, xfer, next);
@@ -773,6 +871,10 @@ static void usb_host_iso_data_out(USBHostDevice *s, USBPacket *p)
                 disconnect = true;
             }
             break;
+        }
+        if (s->isodebug) {
+            ring->stats.submitted += s->iso_urb_frames;
+            ring->stats.starts += QTAILQ_EMPTY(&ring->inflight);
         }
         if (QTAILQ_EMPTY(&ring->inflight)) {
             trace_usb_host_iso_start(s->bus_num, s->addr, p->ep->nr);
@@ -1158,6 +1260,13 @@ static void usb_host_nodev(USBHostDevice *s)
 static void usb_host_exit_notifier(struct Notifier *n, void *data)
 {
     USBHostDevice *s = container_of(n, USBHostDevice, exit);
+    USBHostIsoRing *ring;
+
+    QTAILQ_FOREACH(ring, &s->isorings, next) {
+        if (ring->report_timer) {
+            usb_host_iso_report(ring);
+        }
+    }
 
     if (s->dh) {
         usb_host_abort_xfers(s);
@@ -1209,6 +1318,18 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
         return;
     }
 
+    if (s->isotap) {
+        if (!s->isodebug) {
+            error_setg(errp, "isotap requires isodebug=on");
+            return;
+        }
+        s->isotap_fd = qemu_create(s->isotap, O_WRONLY | O_EXCL | O_BINARY,
+                                   0600, errp);
+        if (s->isotap_fd < 0) {
+            return;
+        }
+    }
+
     loglevel = s->loglevel;
     udev->flags |= (1 << USB_DEV_FLAG_IS_HOST);
     udev->auto_attach = 0;
@@ -1222,12 +1343,12 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
         s->needs_autoscan = false;
         fd = qemu_open(s->hostdevice, O_RDWR, errp);
         if (fd < 0) {
-            return;
+            goto fail;
         }
         rc = usb_host_open(s, NULL, fd);
         if (rc < 0) {
             error_setg(errp, "failed to open host usb device %s", s->hostdevice);
-            return;
+            goto fail;
         }
     } else
 #endif
@@ -1241,14 +1362,14 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
         if (!ldev) {
             error_setg(errp, "failed to find host usb device %d:%d",
                        s->match.bus_num, s->match.addr);
-            return;
+            goto fail;
         }
         rc = usb_host_open(s, ldev, 0);
         libusb_unref_device(ldev);
         if (rc < 0) {
             error_setg(errp, "failed to open host usb device %d:%d",
                        s->match.bus_num, s->match.addr);
-            return;
+            goto fail;
         }
     } else {
         s->needs_autoscan = true;
@@ -1258,6 +1379,13 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
 
     s->exit.notify = usb_host_exit_notifier;
     qemu_add_exit_notifier(&s->exit);
+    return;
+
+fail:
+    if (s->isotap_fd >= 0) {
+        qemu_close(s->isotap_fd);
+        s->isotap_fd = -1;
+    }
 }
 
 static void usb_host_instance_init(Object *obj)
@@ -1265,6 +1393,7 @@ static void usb_host_instance_init(Object *obj)
     USBDevice *udev = USB_DEVICE(obj);
     USBHostDevice *s = USB_HOST_DEVICE(udev);
 
+    s->isotap_fd = -1;
     device_add_bootindex_property(obj, &s->bootindex,
                                   "bootindex", NULL,
                                   &udev->qdev);
@@ -1279,6 +1408,10 @@ static void usb_host_unrealize(USBDevice *udev)
         QTAILQ_REMOVE(&hostdevs, s, next);
     }
     usb_host_close(s);
+    if (s->isotap_fd >= 0) {
+        qemu_close(s->isotap_fd);
+        s->isotap_fd = -1;
+    }
 }
 
 static void usb_host_cancel_packet(USBDevice *udev, USBPacket *p)
@@ -1795,6 +1928,8 @@ static const Property usb_host_dev_properties[] = {
 #if LIBUSB_API_VERSION >= 0x01000107
     DEFINE_PROP_STRING("hostdevice", USBHostDevice, hostdevice),
 #endif
+    DEFINE_PROP_BOOL("isodebug", USBHostDevice, isodebug, false),
+    DEFINE_PROP_STRING("isotap", USBHostDevice, isotap),
     DEFINE_PROP_UINT32("isobufs",  USBHostDevice, iso_urb_count,    4),
     DEFINE_PROP_UINT32("isobsize", USBHostDevice, iso_urb_frames,   32),
     DEFINE_PROP_BOOL("guest-reset", USBHostDevice,
